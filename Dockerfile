@@ -1,8 +1,7 @@
 FROM colmap/colmap:latest
-MAINTAINER Paul-Edouard Sarlin
 RUN apt-get update -y
-RUN apt-get install python3 python3-pip unzip wget -y
-COPY . /app
+RUN apt-get install python3 python3-pip unzip wget libomp-dev -y
+COPY ./requirements.txt /app/requirements.txt
 WORKDIR app/
 RUN pip3 install --upgrade pip
 RUN pip3 install -r requirements.txt
