@@ -6,9 +6,13 @@ import alphashape
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 
-import os
+import os, logging, h5py, pickle, cv2
 
 from PIL import Image, ImageDraw
+from tqdm import tqdm
+from collections import defaultdict
+from scipy import spatial
+import pycolmap
 
 def box_preprocess(data, w, h):
 #     print(w, h, len(data))
@@ -153,7 +157,7 @@ class Patch:
         return AS.area/self.area
     
     
-def test_generate_patches(images, do_croping = False, crop_output_dir = None):
+def test_generate_patches(images, box_dir, test_image2patch_path, image_dir, do_croping = False, crop_output_dir = None):
     patch_list = list()
     image2patch = dict()
     
@@ -201,12 +205,16 @@ def test_generate_patches(images, do_croping = False, crop_output_dir = None):
             patch_cnt += 1
 
     print("number of patches:", len(patch_list))  
+    
+    with open(test_image2patch_path, "wb") as f:
+        pickle.dump(image2patch,f)
+        
     return patch_list, image2patch
 
 
 
 
-def database_generate_patches(images, image2patch_path):
+def database_generate_patches(images, cameras, box_dir, image2patch_path):
     patch_list = list()
     image2patch = dict()
     
@@ -220,7 +228,7 @@ def database_generate_patches(images, image2patch_path):
 
         box_file_name = image.name.split('.')[0] + ".npy"
 
-        image2patch[image_id] = list()
+        image2patch[image.name] = list()
 
         matched = image.point3D_ids != -1
         points3D_covis = image.point3D_ids[matched]
@@ -266,38 +274,41 @@ def database_generate_patches(images, image2patch_path):
 
 
 #  patches match and merge
-def co_vis_grouping(patch_list, patch_set_path, db_image_pairs_path, image2patch_path, 
+def co_vis_grouping(patch_list, patch_set_path, db_image_pairs_path, image2patch_path, image_dir,
                     do_crop = False, group_output_dir = None, images = None):
     
-    patch_set = PatchSet()
+    if os.path.exists(patch_set_path):
+        with open(patch_set_path, "rb") as f:
+            patch_set = pickle.load(f)
+    else:
+        patch_set = PatchSet()
 
-    for i in range(len(patch_list)):
-        patch_set.fa.append(i)
-        
-    with open(image2patch_path, "rb") as f:
-        image2patch = pickle.load(f)
-   
-    with open(db_image_pairs_path, "r") as f:
-        db_image_pairs = f.readlines()
-        
-    logging.info("grouping...")
-    
-    for pair in tqdm(db_image_pairs):
-        image1 = pair.split()[0]
-        image2 = pair.split()[1]
-        patches1 = image2patch[image1]
-        patches2 = image2patch[image1]
-        
-        for patch1_id in patches1:
-            for patch2_id in patches2:
-                if patch_set.find(patch2_id) != patch2_id:
-                    continue
-                if (patch_list[patch1_id].check_match(patch_list[patch2_id]) and
-                    patch_list[patch_set.find(patch1_id)].check_match(patch_list[patch2_id])):
-                    patch_set.merge(patch1_id, patch2_id)        
-    
-    with open(patch_set_path, "wb") as f:
-        pickle.dump(patch_set, f)
+        for i in range(len(patch_list)):
+            patch_set.fa.append(i)
+
+        with open(image2patch_path, "rb") as f:
+            image2patch = pickle.load(f)
+
+        with open(db_image_pairs_path, "r") as f:
+            db_image_pairs = f.readlines()
+
+        logging.info("grouping...")
+
+        for pair in tqdm(db_image_pairs):
+            image1 = pair.split()[0]
+            image2 = pair.split()[1]
+            if image1 < image2:
+                continue
+            for patch1_id in image2patch[image1]:
+                for patch2_id in image2patch[image2]:
+                    if patch_set.find(patch2_id) != patch2_id:
+                        continue
+                    if (patch_list[patch1_id].check_match(patch_list[patch2_id]) and
+                        patch_list[patch_set.find(patch1_id)].check_match(patch_list[patch2_id])):
+                        patch_set.merge(patch1_id, patch2_id)        
+
+        with open(patch_set_path, "wb") as f:
+            pickle.dump(patch_set, f)
      
     if do_crop:
         logging.info("Cropping...")
@@ -310,17 +321,20 @@ def co_vis_grouping(patch_list, patch_set_path, db_image_pairs_path, image2patch
 
 
 
-def db_patch_point_bind(groups_patch_points_path, groups_image_points_path, 
+def db_patch_point_bind(groups_patch_points_path, groups_image_points_path, patch_set_path, 
                         image2patch_path, new_images, patch_list):
     groups_patch_points=defaultdict(set) # for retrieval result examine
     groups_image_points=defaultdict(set) # for localization 
 
-    with open(image2patch_path, "wb") as f:
+    with open(image2patch_path, "rb") as f:
         image2patch = pickle.load(f)
         
+    with open(patch_set_path, "rb") as f:
+        patch_set = pickle.load(f)
+        
     for image_id, image in tqdm(new_images.items()):
-        patches = image2patch[image_id]
-        p3d_id_set = set(new_images.point3D_ids)
+        patches = image2patch[image.name]
+        p3d_id_set = set(image.point3D_ids)
         for patch_id in patches:
             group_id = patch_set.find(patch_id)
             groups_image_points[group_id] = groups_image_points[group_id].union(p3d_id_set) 
@@ -354,11 +368,11 @@ def generate_group_descriptor(db_feature_path ):
     database=np.array(database)
     print(database.shape)
     tree = spatial.KDTree(database)
-return tree
+    return tree, class_list
 
 
 
-def group_retrival(test_desc, tree, k = 5, gt = None):
+def group_retrival(test_desc, tree,  class_list, k = 5, gt = None):
     gt_posi = dict()
     ave_posi = 0
     recall = 0
@@ -387,12 +401,16 @@ def group_retrival(test_desc, tree, k = 5, gt = None):
 
 
 
-def localize(query_images, test_retrieve_groups, local_feature_path, point_desc_path, test_image2patch_path, k = 5)
+def localize(query_images, test_retrieve_groups, local_feature_path, point_desc_path, test_image2patch,
+             groups_image_points_path, points3D_new,images_new,cameras_new,k = 5):
 
 
-    with open(test_image2patch_path, "wb") as f:
-        test_image2patch = pickle.load(f)
+#     with open(test_image2patch_path, "rb") as f:
+#         test_image2patch = pickle.load(f)
 
+    with open(groups_image_points_path, "rb") as f:
+        groups_image_points = pickle.load(f)
+        
     f = h5py.File(local_feature_path, 'r')
 
     FLANN_INDEX_KDTREE = 0
@@ -492,4 +510,4 @@ def localize(query_images, test_retrieve_groups, local_feature_path, point_desc_
     f.close()
     point_desc_file.close()
 
-return result, max_inlier_nums
+    return result, max_inlier_nums
